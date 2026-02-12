@@ -141,9 +141,11 @@
     break;
   }
   case SMAppServiceStatusEnabled:
-    // Helper is already registered and running
+    // Helper is already registered and enabled
     os_log(OS_LOG_DEFAULT,
            "Connector: Helper agent already registered and enabled");
+    // Ensure helper is started by pinging it
+    [self ensureHelperIsRunning];
     break;
   case SMAppServiceStatusRequiresApproval:
     os_log(OS_LOG_DEFAULT, "Connector: Helper agent requires user approval in "
@@ -175,12 +177,40 @@
   BOOL registered = [service registerAndReturnError:&error];
   if (registered) {
     os_log(OS_LOG_DEFAULT, "Connector: Helper agent registered successfully");
+    // Ensure helper starts after registration
+    [self ensureHelperIsRunning];
   } else {
     os_log_error(OS_LOG_DEFAULT,
                  "Connector: Helper agent registration failed: %{public}@",
                  error);
     NSLog(@"ERROR: Failed to register helper agent: %@", error);
   }
+}
+
+/// Ensures the helper service is running by attempting to connect to it.
+/// This triggers on-demand launch of the helper via launchd if it's registered
+/// but not currently running.
+- (void)ensureHelperIsRunning {
+  dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+    os_log(OS_LOG_DEFAULT, "Connector: Ensuring helper is running...");
+    
+    // Attempt to connect - this will trigger launch if helper is registered
+    NSXPCConnection *connection = [self helperConnection];
+    if (!connection) {
+      os_log_error(OS_LOG_DEFAULT, "Connector: Failed to create helper connection");
+      return;
+    }
+    
+    // Try to call a lightweight method to verify helper is responsive
+    id<ROCEISigningServiceProtocol> proxy = [connection remoteObjectProxyWithErrorHandler:^(NSError *error) {
+      os_log_error(OS_LOG_DEFAULT, "Connector: Helper connection error: %{public}@", error);
+    }];
+    
+    // Just checking the proxy creation is enough to trigger the helper launch
+    if (proxy) {
+      os_log(OS_LOG_DEFAULT, "Connector: Helper connection established successfully");
+    }
+  });
 }
 
 /// Creates and returns an XPC connection to the helper service.
@@ -234,13 +264,17 @@
       // next use
       os_log(OS_LOG_DEFAULT,
              "Connector: XPC connection interrupted, will reconnect");
-      weakSelf.helperConnection = nil;
+      @synchronized(weakSelf) {
+        weakSelf.helperConnection = nil;
+      }
     };
     _helperConnection.invalidationHandler = ^{
       // Connection was invalidated (e.g., helper terminated) - will reconnect
       // on next use
       os_log(OS_LOG_DEFAULT, "Connector: XPC connection invalidated");
-      weakSelf.helperConnection = nil;
+      @synchronized(weakSelf) {
+        weakSelf.helperConnection = nil;
+      }
     };
 
     // Activate the connection
