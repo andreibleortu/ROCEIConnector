@@ -425,17 +425,18 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
   NSString *path = [self modulePath];
 
   // ── Determine whether hash verification should be skipped ─────────────
-  // We skip SHA-512 hash verification in two cases:
+  // We skip SHA-512 hash verification when the library is inside a code-signed
+  // app bundle (our own or a parent's):
   //
   //   1. Library inside our own app/appex bundle — protected by macOS code
   //      signing.  The build script re-signs copied dylibs with our
   //      identity, which changes their SHA-512 hash.
   //
-  //   2. Library in our Application Support cache — the Connector app
-  //      validates the source library hash (from IDplugManager) *before*
-  //      copying it to Application Support.  macOS may re-sign the copy,
-  //      changing its hash, so verifying it again would cause spurious
-  //      failures.
+  //   2. Library inside a *parent* .app bundle that also contains our own
+  //      bundle.  This handles the ROCEIHelper (a LaunchAgent at
+  //      .app/Contents/Library/LoginItems/ROCEIHelper.app) loading a
+  //      library from the main app's PlugIns directory — the parent app
+  //      bundle is code-signed, so macOS protects its integrity.
   //
   // Hash verification is enforced only for libraries loaded directly from
   // external locations (e.g. the IDplugManager install directory).
@@ -443,9 +444,23 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
   BOOL isInsideOwnBundle =
       (mainBundlePath.length > 0 &&
        [path hasPrefix:[mainBundlePath stringByAppendingString:@"/"]]);
-  BOOL isAppSupportCache =
-      [path isEqualToString:PKCS11AppSupportLibraryPath()];
-  BOOL skipHashVerification = isInsideOwnBundle || isAppSupportCache;
+
+  // Check parent .app bundles: if our bundle is embedded inside a parent
+  // application (e.g. ROCEIHelper.app inside RO CEI Connector.app), also
+  // trust libraries inside that parent app bundle.
+  if (!isInsideOwnBundle && mainBundlePath.length > 0) {
+    NSString *ancestor = mainBundlePath;
+    while (ancestor.length > 1) {
+      ancestor = [ancestor stringByDeletingLastPathComponent];
+      if ([ancestor hasSuffix:@".app"]) {
+        isInsideOwnBundle =
+            [path hasPrefix:[ancestor stringByAppendingString:@"/"]];
+        break;
+      }
+    }
+  }
+
+  BOOL skipHashVerification = isInsideOwnBundle;
 
   // ── SECURITY: Verify library hash before loading ──────────────────────
   // TOCTOU mitigation: open the file once via fd, hash from the fd, then
@@ -472,18 +487,14 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
   }
 
   if (skipHashVerification) {
-    // Library is either inside our own code-signed bundle (macOS validates
-    // its integrity) or in our Application Support cache (the Connector
-    // app validated the source before copying).  In both cases the copy
-    // may be re-signed, changing the SHA-512 hash, so skip verification.
+    // Library is inside a code-signed app bundle (macOS validates its
+    // integrity via code signing).  The build script re-signs bundled
+    // dylibs, changing the SHA-512 hash, so skip verification.
     close(hashFd);
     os_log(OS_LOG_DEFAULT,
            "PKCS11: Skipping SHA-512 hash verification for %{public}@ "
-           "(%{public}@)",
-           path,
-           isInsideOwnBundle ? @"inside own bundle — covered by code signing"
-                             : @"Application Support cache — source verified "
-                               @"before copying");
+           "(inside app bundle — covered by code signing)",
+           path);
   } else {
     // External library — verify SHA-512 hash (supply-chain gate)
     NSString *actualHash = PKCS11ComputeSHA512FromFd(hashFd);

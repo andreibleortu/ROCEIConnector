@@ -22,9 +22,6 @@ NS_ASSUME_NONNULL_BEGIN
 /// Filename of the IDEMIA PKCS#11 dynamic library.
 static NSString *const kPKCS11LibraryName = @"libidplug-pkcs11.dylib";
 
-/// Application Support sub-directory used for a cached copy of the library.
-static NSString *const kPKCS11AppSupportSubdir = @"com.andrei.rocei.connector";
-
 /// Relative path from the main app bundle root to the appex Resources dir.
 static NSString *const kPKCS11AppexSubpath =
     @"Contents/PlugIns/ROCEIExtension.appex/Contents/Resources";
@@ -43,15 +40,6 @@ static inline NSString *PKCS11IDplugManagerLibraryPath(void) {
       stringByAppendingPathComponent:kPKCS11LibraryName];
 }
 
-/// Returns the Application Support cached-copy path.
-static inline NSString *PKCS11AppSupportLibraryPath(void) {
-  NSURL *appSupport = [[[NSFileManager defaultManager]
-      URLsForDirectory:NSApplicationSupportDirectory
-             inDomains:NSUserDomainMask] firstObject];
-  return [[[appSupport URLByAppendingPathComponent:kPKCS11AppSupportSubdir]
-      URLByAppendingPathComponent:kPKCS11LibraryName] path];
-}
-
 /// Searches for libidplug-pkcs11.dylib in a well-defined priority order that
 /// works correctly regardless of which target (app, appex, helper) is running:
 ///
@@ -59,8 +47,7 @@ static inline NSString *PKCS11AppSupportLibraryPath(void) {
 ///   2. Appex Resources relative to current bundle  (matches from main app)
 ///   3. Parent-app's appex Resources  (matches from embedded helper/login item
 ///      at Contents/Library/LoginItems/)
-///   4. ~/Library/Application Support cache
-///   5. /Applications/IDplugManager.app
+///   4. /Applications/IDplugManager.app
 ///
 /// Duplicate paths are skipped so the function never stat()s the same file
 /// twice.  Returns nil if the library is not found anywhere.
@@ -87,10 +74,7 @@ static inline NSString *_Nullable PKCS11FindLibraryPath(void) {
         stringByAppendingPathComponent:@"Contents/Resources"]
         stringByAppendingPathComponent:kPKCS11LibraryName],
 
-    // 4. Application Support (user-cached copy)
-    PKCS11AppSupportLibraryPath(),
-
-    // 5. IDplugManager installation
+    // 4. IDplugManager installation
     PKCS11IDplugManagerLibraryPath(),
   ];
 

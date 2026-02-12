@@ -495,7 +495,7 @@
       addAdvButton(@"Kill pkcs11-tool", @"Force kill all pkcs11-tool processes",
                    @selector(killPkcs11Processes:));
   self.resetPKCS11Button = addAdvButton(
-      @"Reset PKCS#11", @"Clean all cached library files and state",
+      @"Reset PKCS#11", @"Close sessions, kill processes, clear cached state",
       @selector(resetPKCS11:));
 
   // === RIGHT: Output area ===
@@ -1032,46 +1032,10 @@
   return [self runCommand:launchPath arguments:arguments timeoutSeconds:15];
 }
 
-/// Returns the path where we store the bundled copy of the PKCS#11 library.
-/// Uses Application Support so it persists across app updates and isn't
-/// code-signed.  Delegates to the shared constant in PKCS11.h.
-- (NSString *)bundledPKCS11Path {
-  return PKCS11AppSupportLibraryPath();
-}
-
 /// Returns the best available path to the PKCS#11 library using the shared
-/// search order defined in PKCS11.h (appex Resources → App Support →
-/// IDplugManager).
+/// search order defined in PKCS11.h (appex Resources → IDplugManager).
 - (NSString *)pkcs11ModulePath {
   return PKCS11FindLibraryPath();
-}
-
-/// Copies the PKCS#11 library from IDplugManager into Application Support.
-/// Returns YES on success.
-- (BOOL)copyPKCS11Library {
-  NSFileManager *fm = [NSFileManager defaultManager];
-  NSString *dest = [self bundledPKCS11Path];
-  NSString *destDir = [dest stringByDeletingLastPathComponent];
-
-  NSError *error = nil;
-  [fm createDirectoryAtPath:destDir
-      withIntermediateDirectories:YES
-                       attributes:nil
-                            error:nil];
-
-  // Remove old copy if it exists
-  [fm removeItemAtPath:dest error:nil];
-
-  if ([fm copyItemAtPath:PKCS11IDplugManagerLibraryPath() toPath:dest error:&error]) {
-    os_log(OS_LOG_DEFAULT, "Connector: Copied PKCS#11 library to %{public}@",
-           dest);
-    return YES;
-  } else {
-    os_log_error(OS_LOG_DEFAULT,
-                 "Connector: Failed to copy PKCS#11 library: %{public}@",
-                 error);
-    return NO;
-  }
 }
 
 /// Compute SHA-512 hash of a file. Uses the shared PKCS11ComputeSHA512()
@@ -1129,45 +1093,25 @@
     }
   }
 
-  NSString *bundled = [self bundledPKCS11Path];
-  if (![fm fileExistsAtPath:bundled]) {
-    if ([fm fileExistsAtPath:idplugSourcePath]) {
-      // IDplugManager is installed — copy the library automatically
-      if ([self copyPKCS11Library]) {
-        os_log(OS_LOG_DEFAULT, "Connector: PKCS#11 library copied from "
-                               "IDplugManager on first launch");
-      }
-    } else {
-      // IDplugManager not installed — show alert
-      NSAlert *alert = [[NSAlert alloc] init];
-      alert.alertStyle = NSAlertStyleCritical;
-      alert.messageText = @"IDplugManager is required";
-      alert.informativeText =
-          @"The IDEMIA PKCS#11 library (libidplug-pkcs11.dylib) was not "
-          @"found.\n\n"
-           "This library is provided by IDplugManager.app and is required for "
-           "all smart card operations.\n\n"
-           "Install IDplugManager first, then relaunch this app.";
-      [alert addButtonWithTitle:@"Quit"];
-      [alert addButtonWithTitle:@"Continue Anyway"];
-      NSModalResponse response = [alert runModal];
-      if (response == NSAlertFirstButtonReturn) {
-        [NSApp terminate:nil];
-        return;
-      }
-    }
-  } else if ([fm fileExistsAtPath:idplugSourcePath]) {
-    // Both exist — update bundled copy if IDplugManager's is newer
-    NSDictionary *srcAttrs = [fm attributesOfItemAtPath:idplugSourcePath
-                                                  error:nil];
-    NSDictionary *dstAttrs = [fm attributesOfItemAtPath:bundled error:nil];
-    NSDate *srcDate = srcAttrs[NSFileModificationDate];
-    NSDate *dstDate = dstAttrs[NSFileModificationDate];
-    if (srcDate && dstDate &&
-        [srcDate compare:dstDate] == NSOrderedDescending) {
-      [self copyPKCS11Library];
-      os_log(OS_LOG_DEFAULT, "Connector: Updated bundled PKCS#11 library "
-                             "(IDplugManager copy is newer)");
+  // Check if the library is available from any location (bundle or
+  // IDplugManager)
+  NSString *modulePath = [self pkcs11ModulePath];
+  if (!modulePath) {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.alertStyle = NSAlertStyleCritical;
+    alert.messageText = @"IDplugManager is required";
+    alert.informativeText =
+        @"The IDEMIA PKCS#11 library (libidplug-pkcs11.dylib) was not "
+        @"found.\n\n"
+         "This library is provided by IDplugManager.app and is required for "
+         "all smart card operations.\n\n"
+         "Install IDplugManager first, then relaunch this app.";
+    [alert addButtonWithTitle:@"Quit"];
+    [alert addButtonWithTitle:@"Continue Anyway"];
+    NSModalResponse response = [alert runModal];
+    if (response == NSAlertFirstButtonReturn) {
+      [NSApp terminate:nil];
+      return;
     }
   }
 
@@ -3104,8 +3048,8 @@
 }
 
 /// Full PKCS#11 reset: closes sessions (C_Finalize), kills pkcs11-tool
-/// processes, removes the cached PKCS#11 library, and clears cached
-/// certificates. Shows a confirmation dialog before proceeding.
+/// processes, and clears cached certificates.
+/// Shows a confirmation dialog before proceeding.
 ///
 /// @param sender The button that triggered the action
 - (IBAction)resetPKCS11:(id)sender {
@@ -3114,8 +3058,7 @@
   alert.messageText = @"Reset PKCS#11?";
   alert.informativeText =
       @"This will:\n• Close all open PKCS#11 sessions (C_Finalize)\n• Kill all "
-      @"pkcs11-tool processes\n• Remove cached PKCS#11 library\n• Clear cached "
-      @"certificates\n• Force library re-copy on next use\n\nContinue?";
+      @"pkcs11-tool processes\n• Clear cached certificates\n\nContinue?";
   [alert addButtonWithTitle:@"Reset"];
   [alert addButtonWithTitle:@"Cancel"];
   alert.alertStyle = NSAlertStyleWarning;
@@ -3130,8 +3073,6 @@
 
   NSUInteger finalizeRow = [self addRowWithTitle:@"Close Sessions" waiting:NO];
   NSUInteger killRow = [self addRowWithTitle:@"Kill Processes" waiting:YES];
-  NSUInteger libRow = [self addRowWithTitle:@"Remove Cached Library"
-                                    waiting:YES];
   NSUInteger certRow = [self addRowWithTitle:@"Clear Cached Certs" waiting:YES];
 
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -3189,44 +3130,9 @@
               summary:killHasError ? @"Failed" : @"Done"
                detail:killOutput];
 
-    // 3. Remove Application Support directory (cached PKCS#11 library)
-    [self startRow:libRow];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *appSupportURLs = [fm URLsForDirectory:NSApplicationSupportDirectory
-                                         inDomains:NSUserDomainMask];
-    NSString *libDetail = nil;
-    BOOL libOK = YES;
-    if (appSupportURLs.count > 0) {
-      NSURL *appSupportURL = appSupportURLs[0];
-      NSURL *roceiDir = [appSupportURL
-          URLByAppendingPathComponent:@"com.andrei.rocei.connector"];
-
-      NSError *removeError = nil;
-      if ([fm fileExistsAtPath:roceiDir.path]) {
-        if ([fm removeItemAtURL:roceiDir error:&removeError]) {
-          libDetail = [NSString stringWithFormat:@"Removed %@", roceiDir.path];
-        } else {
-          libDetail = [NSString
-              stringWithFormat:@"Failed: %@", removeError.localizedDescription];
-          libOK = NO;
-        }
-      } else {
-        libDetail = @"Already clean";
-      }
-    } else {
-      libDetail = @"Application Support not found";
-    }
-    [self completeRow:libRow
-              success:libOK
-              summary:libOK ? (libDetail.length > 0 &&
-                                       [libDetail hasPrefix:@"Already"]
-                                   ? @"Already clean"
-                                   : @"Removed")
-                            : @"Failed"
-               detail:libDetail];
-
-    // 4. Clear cached certificate files from extension container
+    // 3. Clear cached certificate files from extension container
     [self startRow:certRow];
+    NSFileManager *fm = [NSFileManager defaultManager];
     NSMutableString *certDetail = [NSMutableString string];
     BOOL certOK = YES;
     NSArray *containerURLs = [fm URLsForDirectory:NSLibraryDirectory

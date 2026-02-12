@@ -378,7 +378,7 @@ The helper service (which accesses the PKCS#11 library) runs as a separate proce
 
 Loading and interacting with the native PKCS#11 library is protected at multiple levels:
 
-- **SHA-512 hash verification**: Before `dlopen()`, the app computes and verifies the library hash against a whitelist of known-good versions for libraries loaded directly from IDplugManager. Bundled copies and Application Support cached copies skip hash verification because macOS may re-sign them (changing the hash); the bundled copy is covered by code signing, and the cached copy's source is validated before copying.
+- **SHA-512 hash verification**: Before `dlopen()`, the app computes and verifies the library hash against a whitelist of known-good versions for libraries loaded directly from IDplugManager. Bundled copies and libraries inside a parent app bundle (e.g. loaded by the XPC helper from the main app's PlugIns) skip hash verification because macOS re-signs them at build time (changing the hash); bundled copies are covered by code signing.
 - **Multi-version support**: The hash whitelist (`knownGoodLibraryHashes()` in `PKCS11.m`) allows multiple IDplugManager versions, enabling version transitions without forced app updates.
 - **Per-thread CWD changes**: Uses `__pthread_fchdir()` kernel syscall (macOS 10.5+) to change directory only for the calling thread during `dlopen()`. Falls back to serialized `fchdir()` if unavailable. This prevents other threads (including CryptoTokenKit internals) from observing changed working directory.
 - **Timeout protection**: All blocking PKCS#11 calls (C_Login, C_Sign, etc.) run on background dispatch queues with timeouts to prevent indefinite hangs if the card becomes unresponsive.
