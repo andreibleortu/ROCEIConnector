@@ -38,10 +38,12 @@ extern int __pthread_fchdir(int fd) __attribute__((weak_import));
 /// This avoids the TOCTOU window that exists when hashing by path then
 /// separately opening via dlopen.  The fd is read from offset 0.
 static NSString *_Nullable PKCS11ComputeSHA512FromFd(int fd) {
-  if (fd < 0) return nil;
+  if (fd < 0)
+    return nil;
 
   // Seek to beginning
-  if (lseek(fd, 0, SEEK_SET) != 0) return nil;
+  if (lseek(fd, 0, SEEK_SET) != 0)
+    return nil;
 
   CC_SHA512_CTX ctx;
   CC_SHA512_Init(&ctx);
@@ -51,7 +53,8 @@ static NSString *_Nullable PKCS11ComputeSHA512FromFd(int fd) {
   while ((n = read(fd, buf, sizeof(buf))) > 0) {
     CC_SHA512_Update(&ctx, buf, (CC_LONG)n);
   }
-  if (n < 0) return nil; // read error
+  if (n < 0)
+    return nil; // read error
 
   unsigned char digest[CC_SHA512_DIGEST_LENGTH];
   CC_SHA512_Final(digest, &ctx);
@@ -104,7 +107,8 @@ static NSData *_Nullable PKCS11DERUnwrapOctetString(NSData *der) {
     for (uint8_t i = 0; i < n; i++) {
       contentLen = (contentLen << 8) | p[offset + i];
     }
-    // Additional check: if n == 1 and value <= 0x7F, should have used short form
+    // Additional check: if n == 1 and value <= 0x7F, should have used short
+    // form
     if (n == 1 && contentLen <= 0x7F)
       return nil;
     offset += n;
@@ -225,8 +229,8 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
     // Check if module already exists for this path
     PKCS11Module *existing = gSharedModules[modulePath];
     if (existing) {
-      os_log(OS_LOG_DEFAULT,
-             "PKCS11: returning cached module for %{public}@", modulePath);
+      os_log(OS_LOG_DEFAULT, "PKCS11: returning cached module for %{public}@",
+             modulePath);
       module = existing;
     } else {
       // Create and initialize new module
@@ -337,8 +341,8 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
 /// removing this module while an operation is in flight.
 - (void)beginUse {
   int prev = atomic_fetch_add(&_activeUseCount, 1);
-  os_log_debug(OS_LOG_DEFAULT,
-               "PKCS11: beginUse (activeUseCount %d → %d)", prev, prev + 1);
+  os_log_debug(OS_LOG_DEFAULT, "PKCS11: beginUse (activeUseCount %d → %d)",
+               prev, prev + 1);
 }
 
 /// Decrements the atomic use-count. Logs an error on underflow.
@@ -349,8 +353,8 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
                  "PKCS11: endUse called with activeUseCount=%d (underflow!)",
                  prev);
   } else {
-    os_log_debug(OS_LOG_DEFAULT,
-                 "PKCS11: endUse (activeUseCount %d → %d)", prev, prev - 1);
+    os_log_debug(OS_LOG_DEFAULT, "PKCS11: endUse (activeUseCount %d → %d)",
+                 prev, prev - 1);
   }
 }
 
@@ -395,7 +399,8 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
 /// Loads the PKCS#11 library and initializes it.
 /// This method:
 /// 1. Verifies the library's SHA-512 hash (supply-chain defence)
-/// 2. Serializes fchdir+dlopen via semaphore (thread safety - minimizes CWD change window)
+/// 2. Serializes fchdir+dlopen via semaphore (thread safety - minimizes CWD
+/// change window)
 /// 3. Sets the current working directory (some libraries require config files
 /// relative to CWD)
 /// 4. Dynamically loads the PKCS#11 library via dlopen
@@ -418,6 +423,19 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
   }
 
   NSString *path = [self modulePath];
+
+  // ── Determine whether the library lives inside our own app bundle ─────
+  // Libraries bundled inside the .app (or .appex) are protected by macOS
+  // code signing — the OS validates the signature at load time.  The build
+  // script also re-signs copied dylibs with our identity, which changes
+  // their SHA-512 hash.  So we only enforce our own hash verification for
+  // libraries loaded from *external* locations (IDplugManager install dir,
+  // Application Support cache, etc.) where macOS code signing does not
+  // cover them.
+  NSString *mainBundlePath = [NSBundle mainBundle].bundlePath;
+  BOOL isInsideOwnBundle =
+      (mainBundlePath.length > 0 &&
+       [path hasPrefix:[mainBundlePath stringByAppendingString:@"/"]]);
 
   // ── SECURITY: Verify library hash before loading ──────────────────────
   // TOCTOU mitigation: open the file once via fd, hash from the fd, then
@@ -443,38 +461,55 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
     return NO;
   }
 
-  NSString *actualHash = PKCS11ComputeSHA512FromFd(hashFd);
-  close(hashFd);
+  if (isInsideOwnBundle) {
+    // Library is inside our own code-signed bundle — macOS validates its
+    // integrity via the app's code signature.  Skip SHA-512 verification
+    // because the build process re-signs the dylib, changing its hash.
+    close(hashFd);
+    os_log(OS_LOG_DEFAULT,
+           "PKCS11: Library is inside own bundle (%{public}@) — "
+           "skipping SHA-512 hash verification (covered by code signing)",
+           path);
+  } else {
+    // External library — verify SHA-512 hash (supply-chain gate)
+    NSString *actualHash = PKCS11ComputeSHA512FromFd(hashFd);
+    close(hashFd);
 
-  if (!actualHash) {
-    if (error) {
-      *error = PKCS11MakeError(
-          -1,
-          [NSString stringWithFormat:@"Failed to compute hash for %@", path]);
+    if (!actualHash) {
+      if (error) {
+        *error = PKCS11MakeError(
+            -1,
+            [NSString stringWithFormat:@"Failed to compute hash for %@", path]);
+      }
+      return NO;
     }
-    return NO;
-  }
 
-  NSArray<NSString *> *knownHashes = PKCS11KnownGoodLibraryHashes();
-  if (![knownHashes containsObject:actualHash]) {
-    os_log_error(OS_LOG_DEFAULT,
-                 "PKCS11: Library hash mismatch! Expected one of %{public}@, "
-                 "got %{public}@",
-                 knownHashes, actualHash);
-    if (error) {
-      NSString *expectedHashList = [knownHashes componentsJoinedByString:@"\n  "];
-      *error = PKCS11MakeError(
-          -1,
-          [NSString stringWithFormat:@"PKCS#11 library hash verification "
-                                     @"failed.\n\nExpected (known-good IDplugManager versions):\n  %@\n\nActual:\n  %@\n\n"
-                                     @"This usually indicates an incompatible IDplugManager version. "
-                                     @"Please ensure you have installed a supported version of IDplugManager (4.5.0 or compatible).",
-                                     expectedHashList, actualHash]);
+    NSArray<NSString *> *knownHashes = PKCS11KnownGoodLibraryHashes();
+    if (![knownHashes containsObject:actualHash]) {
+      os_log_error(OS_LOG_DEFAULT,
+                   "PKCS11: Library hash mismatch! Expected one of %{public}@, "
+                   "got %{public}@",
+                   knownHashes, actualHash);
+      if (error) {
+        NSString *expectedHashList =
+            [knownHashes componentsJoinedByString:@"\n  "];
+        *error = PKCS11MakeError(
+            -1,
+            [NSString stringWithFormat:
+                          @"PKCS#11 library hash verification "
+                          @"failed.\n\nExpected (known-good IDplugManager "
+                          @"versions):\n  %@\n\nActual:\n  %@\n\n"
+                          @"This usually indicates an incompatible "
+                          @"IDplugManager version. "
+                          @"Please ensure you have installed a supported "
+                          @"version of IDplugManager (4.5.0 or compatible).",
+                          expectedHashList, actualHash]);
+      }
+      return NO;
     }
-    return NO;
+    os_log(OS_LOG_DEFAULT, "PKCS11: Library hash verified: %{public}@",
+           actualHash);
   }
-  os_log(OS_LOG_DEFAULT, "PKCS11: Library hash verified: %{public}@",
-         actualHash);
 
   // ── CWD change for dlopen ──────────────────────────────────────────────
   // IDEMIA's libidplug-pkcs11.dylib requires config files in CWD at dlopen
@@ -691,8 +726,7 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
 #pragma clang diagnostic ignored "-Wnonnull"
   rv = self.fn_GetSlotList(1, NULL, &slotCount);
 #pragma clang diagnostic pop
-  os_log(OS_LOG_DEFAULT,
-         "PKCS11: C_GetSlotList returned: 0x%08lx, count=%lu",
+  os_log(OS_LOG_DEFAULT, "PKCS11: C_GetSlotList returned: 0x%08lx, count=%lu",
          (unsigned long)rv, (unsigned long)slotCount);
 
   self.initialized = YES;
@@ -830,15 +864,13 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
 
   // Log all available slots for debugging
   for (CK_ULONG i = 0; i < count; i++) {
-    os_log(OS_LOG_DEFAULT,
-           "PKCS11: C_GetSlotList: slot[%lu] = 0x%lx (%lu)",
+    os_log(OS_LOG_DEFAULT, "PKCS11: C_GetSlotList: slot[%lu] = 0x%lx (%lu)",
            (unsigned long)i, (unsigned long)slots[i], (unsigned long)slots[i]);
   }
   CK_SLOT_ID firstSlot = slots[0];
   free(slots);
 
-  os_log(OS_LOG_DEFAULT,
-         "PKCS11: firstTokenSlot returning: 0x%lx (%lu)",
+  os_log(OS_LOG_DEFAULT, "PKCS11: firstTokenSlot returning: 0x%lx (%lu)",
          (unsigned long)firstSlot, (unsigned long)firstSlot);
   return @(firstSlot);
 }
@@ -910,10 +942,9 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
 
   CK_RV rv = self.fn_CloseSession(session);
   if (rv != CKR_OK) {
-    os_log_error(
-        OS_LOG_DEFAULT,
-        "PKCS11: C_CloseSession FAILED: session=0x%lx rv=0x%lx",
-        (unsigned long)session, (unsigned long)rv);
+    os_log_error(OS_LOG_DEFAULT,
+                 "PKCS11: C_CloseSession FAILED: session=0x%lx rv=0x%lx",
+                 (unsigned long)session, (unsigned long)rv);
     if (error) {
       *error = PKCS11MakeError(
           rv, [NSString stringWithFormat:@"C_CloseSession failed: 0x%08lx",
@@ -977,9 +1008,8 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
       sem, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC));
 
   if (timeout != 0) {
-    os_log_error(OS_LOG_DEFAULT,
-                 "PKCS11: C_Login TIMED OUT after 30 seconds");
-    
+    os_log_error(OS_LOG_DEFAULT, "PKCS11: C_Login TIMED OUT after 30 seconds");
+
     // SECURITY: The background C_Login is still running on an orphaned GCD
     // thread.  We cannot safely call C_Logout or C_CloseSession because:
     // 1. We don't know when the background C_Login will complete
@@ -1389,7 +1419,8 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
 #pragma mark - ECDSA Sign
 
 /// Signs with ECDSA (CKM_ECDSA). The digest must already be hashed.
-/// Protected by a 60-second timeout on each C_Sign call; returns error on timeout.
+/// Protected by a 60-second timeout on each C_Sign call; returns error on
+/// timeout.
 - (BOOL)ecdsaSignWithSession:(CK_SESSION_HANDLE)session
                   privateKey:(CK_OBJECT_HANDLE)key
                       digest:(NSData *)digest
@@ -1446,9 +1477,7 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
   long tmout = dispatch_semaphore_wait(
       sem, dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC));
   if (tmout != 0) {
-    os_log_error(
-        OS_LOG_DEFAULT,
-        "PKCS11: C_Sign TIMED OUT after 60 seconds");
+    os_log_error(OS_LOG_DEFAULT, "PKCS11: C_Sign TIMED OUT after 60 seconds");
     [self markPoisoned];
     if (error) {
       *error = PKCS11MakeError(-1, @"Smart card signing operation timed out. "
@@ -1540,8 +1569,7 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
   CK_RV rv = self.fn_DeriveKey(session, &mech, privateKey, tmpl,
                                sizeof(tmpl) / sizeof(tmpl[0]), &derivedKey);
   if (rv != CKR_OK) {
-    os_log_error(OS_LOG_DEFAULT,
-                 "PKCS11: C_DeriveKey(ECDH) failed: 0x%lx",
+    os_log_error(OS_LOG_DEFAULT, "PKCS11: C_DeriveKey(ECDH) failed: 0x%lx",
                  (unsigned long)rv);
     if (error)
       *error = PKCS11MakeError(
@@ -1550,8 +1578,7 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
                                    (unsigned long)rv]);
     return nil;
   }
-  os_log(OS_LOG_DEFAULT,
-         "PKCS11: C_DeriveKey OK, derived key handle=0x%lx",
+  os_log(OS_LOG_DEFAULT, "PKCS11: C_DeriveKey OK, derived key handle=0x%lx",
          (unsigned long)derivedKey);
 
   // Read raw Z value (the X coordinate of the shared EC point) from derived key
@@ -1560,10 +1587,9 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
   rv = self.fn_GetAttributeValue(session, derivedKey, &valAttr, 1);
   if (rv != CKR_OK || valAttr.ulValueLen == 0 ||
       valAttr.ulValueLen == CK_UNAVAILABLE_INFORMATION) {
-    os_log_error(
-        OS_LOG_DEFAULT,
-        "PKCS11: CKA_VALUE size query failed: rv=0x%lx len=%lu",
-        (unsigned long)rv, (unsigned long)valAttr.ulValueLen);
+    os_log_error(OS_LOG_DEFAULT,
+                 "PKCS11: CKA_VALUE size query failed: rv=0x%lx len=%lu",
+                 (unsigned long)rv, (unsigned long)valAttr.ulValueLen);
     if (error)
       *error = PKCS11MakeError(
           rv,
@@ -1575,8 +1601,7 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
   valAttr.pValue = secret.mutableBytes;
   rv = self.fn_GetAttributeValue(session, derivedKey, &valAttr, 1);
   if (rv != CKR_OK) {
-    os_log_error(OS_LOG_DEFAULT,
-                 "PKCS11: CKA_VALUE read failed: 0x%lx",
+    os_log_error(OS_LOG_DEFAULT, "PKCS11: CKA_VALUE read failed: 0x%lx",
                  (unsigned long)rv);
     if (error)
       *error = PKCS11MakeError(
@@ -1587,8 +1612,7 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
   }
   secret.length = valAttr.ulValueLen; // Update to actual returned size
 
-  os_log(OS_LOG_DEFAULT,
-         "PKCS11: ECDH derive OK, shared secret length=%lu",
+  os_log(OS_LOG_DEFAULT, "PKCS11: ECDH derive OK, shared secret length=%lu",
          (unsigned long)secret.length);
   return [secret copy];
 }
@@ -1617,10 +1641,9 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
   CK_RV rv = self.fn_GetMechanismList(slot, NULL, &count);
 #pragma clang diagnostic pop
   if (rv != CKR_OK) {
-    os_log_error(
-        OS_LOG_DEFAULT,
-        "PKCS11: C_GetMechanismList(count) slot=0x%lx failed: 0x%lx",
-        (unsigned long)slot, (unsigned long)rv);
+    os_log_error(OS_LOG_DEFAULT,
+                 "PKCS11: C_GetMechanismList(count) slot=0x%lx failed: 0x%lx",
+                 (unsigned long)slot, (unsigned long)rv);
     return;
   }
   if (count == 0) {
@@ -1634,17 +1657,16 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
   rv = self.fn_GetMechanismList(
       slot, (CK_MECHANISM_TYPE_PTR)mechBuf.mutableBytes, &count);
   if (rv != CKR_OK) {
-    os_log_error(
-        OS_LOG_DEFAULT,
-        "PKCS11: C_GetMechanismList(list) slot=0x%lx failed: 0x%lx",
-        (unsigned long)slot, (unsigned long)rv);
+    os_log_error(OS_LOG_DEFAULT,
+                 "PKCS11: C_GetMechanismList(list) slot=0x%lx failed: 0x%lx",
+                 (unsigned long)slot, (unsigned long)rv);
     return;
   }
 
   const CK_MECHANISM_TYPE *mechs = (const CK_MECHANISM_TYPE *)mechBuf.bytes;
   os_log(OS_LOG_DEFAULT,
-         "PKCS11: slot 0x%lx supports %lu mechanisms:",
-         (unsigned long)slot, (unsigned long)count);
+         "PKCS11: slot 0x%lx supports %lu mechanisms:", (unsigned long)slot,
+         (unsigned long)count);
   for (CK_ULONG i = 0; i < count; i++) {
     CK_MECHANISM_TYPE mech = mechs[i];
     CK_FLAGS flags = 0;
@@ -1681,11 +1703,10 @@ static NSNumber *_Nullable PKCS11KeySizeBitsFromECParams(NSData *ecParams) {
       name = "CKM_ECDH1_COFACTOR_DERIVE *** ECDH AVAILABLE ***";
       break;
     }
-    os_log(
-        OS_LOG_DEFAULT,
-        "PKCS11:   [%lu] 0x%08lx %{public}s flags=0x%08lx%{public}s",
-        (unsigned long)i, (unsigned long)mech, name, (unsigned long)flags,
-        (flags & CKF_DERIVE) ? " (DERIVE)" : "");
+    os_log(OS_LOG_DEFAULT,
+           "PKCS11:   [%lu] 0x%08lx %{public}s flags=0x%08lx%{public}s",
+           (unsigned long)i, (unsigned long)mech, name, (unsigned long)flags,
+           (flags & CKF_DERIVE) ? " (DERIVE)" : "");
   }
 }
 
