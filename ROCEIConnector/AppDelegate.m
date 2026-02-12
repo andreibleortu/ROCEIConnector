@@ -62,6 +62,7 @@
 @property(strong) NSButton *extensionInfoButton;
 @property(strong) NSButton *killPkcs11Button;
 @property(strong) NSButton *resetPKCS11Button;
+@property(strong) NSButton *uninstallButton;
 // Results GUI
 @property(strong) NSBox *resultsBox;        // Container for status rows
 @property(strong) NSView *resultsView;      // View holding row subviews
@@ -187,29 +188,33 @@
   }
 }
 
-/// Ensures the helper service is running by attempting to connect to it.
-/// This triggers on-demand launch of the helper via launchd if it's registered
-/// but not currently running.
+/// Ensures the helper service is running by sending a ping via XPC.
+/// XPC connections are lazy — launchd only starts the helper when an actual
+/// message is sent, not when the connection object is created.  This method
+/// sends a lightweight ping to trigger on-demand launch after registration.
 - (void)ensureHelperIsRunning {
   dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-    os_log(OS_LOG_DEFAULT, "Connector: Ensuring helper is running...");
+    os_log(OS_LOG_DEFAULT, "Connector: Ensuring helper is running (sending ping)...");
     
-    // Attempt to connect - this will trigger launch if helper is registered
     NSXPCConnection *connection = [self helperConnection];
     if (!connection) {
       os_log_error(OS_LOG_DEFAULT, "Connector: Failed to create helper connection");
       return;
     }
     
-    // Try to call a lightweight method to verify helper is responsive
-    id<ROCEISigningServiceProtocol> proxy = [connection remoteObjectProxyWithErrorHandler:^(NSError *error) {
-      os_log_error(OS_LOG_DEFAULT, "Connector: Helper connection error: %{public}@", error);
-    }];
+    id<ROCEISigningServiceProtocol> proxy =
+        [connection remoteObjectProxyWithErrorHandler:^(NSError *error) {
+          os_log_error(OS_LOG_DEFAULT,
+                       "Connector: Helper ping failed: %{public}@", error);
+        }];
     
-    // Just checking the proxy creation is enough to trigger the helper launch
-    if (proxy) {
-      os_log(OS_LOG_DEFAULT, "Connector: Helper connection established successfully");
-    }
+    // Actually send a message — this triggers launchd to start the helper
+    [proxy pingWithReply:^(BOOL alive, NSString *version) {
+      if (alive) {
+        os_log(OS_LOG_DEFAULT,
+               "Connector: Helper is running (version %{public}@)", version);
+      }
+    }];
   });
 }
 
@@ -435,7 +440,7 @@
   CGFloat advDescH = 12;
   CGFloat advGap = 5;
   CGFloat advItemH = advBtnH + advDescH + advGap;
-  CGFloat advancedHeight = 9 * advItemH + 4; // 9 buttons
+  CGFloat advancedHeight = 10 * advItemH + 4; // 10 buttons
   self.advancedContainer =
       [[NSView alloc] initWithFrame:NSMakeRect(0, advancedTop - advancedHeight,
                                                panelWidth, advancedHeight)];
@@ -497,6 +502,10 @@
   self.resetPKCS11Button = addAdvButton(
       @"Reset PKCS#11", @"Close sessions, kill processes, clear cached state",
       @selector(resetPKCS11:));
+  self.uninstallButton = addAdvButton(
+      @"Uninstall", @"Remove everything and delete the app",
+      @selector(uninstallApp:));
+  self.uninstallButton.contentTintColor = [NSColor systemRedColor];
 
   // === RIGHT: Output area ===
   CGFloat outputX = margin + panelWidth + margin;
@@ -3015,6 +3024,172 @@
     dispatch_async(dispatch_get_main_queue(), ^{
       self.registerExtButton.enabled = YES;
     });
+  });
+}
+
+/// Full uninstall: deregisters the token, unregisters the extension from
+/// PluginKit, unregisters the helper LaunchAgent, kills related daemons,
+/// closes the XPC connection, moves the app to trash, and terminates.
+///
+/// @param sender The button that triggered the action
+- (IBAction)uninstallApp:(id)sender {
+  NSAlert *alert = [[NSAlert alloc] init];
+  alert.messageText = @"Uninstall RO CEI Connector?";
+  alert.informativeText =
+      @"This will:\n"
+      @"\u2022 Deregister the eID token from CryptoTokenKit\n"
+      @"\u2022 Unregister the CryptoTokenKit extension\n"
+      @"\u2022 Unregister the XPC helper service\n"
+      @"\u2022 Move the app to Trash\n"
+      @"\u2022 Quit the app\n\n"
+      @"This cannot be undone.";
+  [alert addButtonWithTitle:@"Uninstall"];
+  [alert addButtonWithTitle:@"Cancel"];
+  alert.alertStyle = NSAlertStyleCritical;
+
+  // Make the Uninstall button red/destructive
+  alert.buttons.firstObject.hasDestructiveAction = YES;
+
+  if ([alert runModal] != NSAlertFirstButtonReturn) {
+    return;
+  }
+
+  [self clearResults];
+  self.uninstallButton.enabled = NO;
+
+  NSUInteger tokenRow = [self addRowWithTitle:@"Deregister Token" waiting:NO];
+  NSUInteger extensionRow = [self addRowWithTitle:@"Unregister Extension"
+                                           waiting:YES];
+  NSUInteger helperRow = [self addRowWithTitle:@"Unregister Helper"
+                                       waiting:YES];
+  NSUInteger cleanupRow = [self addRowWithTitle:@"Cleanup" waiting:YES];
+  NSUInteger trashRow = [self addRowWithTitle:@"Move to Trash" waiting:YES];
+
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    // 1. Deregister token
+    if (@available(macOS 10.15, *)) {
+      NSDictionary<TKTokenDriverClassID, TKTokenDriverConfiguration *>
+          *configs = TKTokenDriverConfiguration.driverConfigurations;
+      TKTokenDriverConfiguration *config =
+          configs[@"com.andrei.rocei.connector.extension"];
+      NSString *instanceID = @"rocei-pkcs11";
+
+      if (config && config.tokenConfigurations[instanceID]) {
+        [config removeTokenConfigurationForTokenInstanceID:instanceID];
+        [self completeRow:tokenRow
+                  success:YES
+                  summary:@"Token deregistered"
+                   detail:nil];
+      } else {
+        [self completeRow:tokenRow
+                  success:YES
+                  summary:@"No token registered"
+                   detail:nil];
+      }
+    } else {
+      [self completeRow:tokenRow
+                success:YES
+                summary:@"Skipped (macOS 10.15+)"
+                 detail:nil];
+    }
+
+    // 2. Unregister extension from PluginKit
+    [self startRow:extensionRow];
+    NSString *appPath = [[NSBundle mainBundle] bundlePath];
+    [self runCommand:@"/usr/bin/pluginkit" arguments:@[ @"-r", appPath ]];
+    [self runCommand:@"/usr/bin/killall" arguments:@[ @"-9", @"ctkd" ]];
+    [self completeRow:extensionRow
+              success:YES
+              summary:@"Extension unregistered"
+               detail:nil];
+
+    // 3. Unregister helper LaunchAgent
+    [self startRow:helperRow];
+    @try {
+      // Invalidate XPC connection first
+      [self.helperConnection invalidate];
+      @synchronized(self) {
+        self.helperConnection = nil;
+      }
+
+      // Unregister the agent via SMAppService
+      SMAppService *service = [SMAppService
+          agentServiceWithPlistName:
+              @"com.andrei.rocei.connector.helper.plist"];
+      NSError *unreg = nil;
+      if ([service unregisterAndReturnError:&unreg]) {
+        [self completeRow:helperRow
+                  success:YES
+                  summary:@"Helper unregistered"
+                   detail:nil];
+      } else {
+        [self completeRow:helperRow
+                  success:NO
+                  summary:@"Unregister failed"
+                   detail:unreg.localizedDescription];
+      }
+    } @catch (NSException *e) {
+      [self completeRow:helperRow
+                success:NO
+                summary:@"Exception"
+                 detail:e.reason];
+    }
+
+    // 4. Kill related processes, clean up certs
+    [self startRow:cleanupRow];
+    [self runCommand:@"/usr/bin/pkill"
+           arguments:@[ @"-9", @"pkcs11-tool" ]
+      timeoutSeconds:5];
+    [self runCommand:@"/usr/bin/killall"
+           arguments:@[ @"-9", @"pluginkit" ]];
+
+    // Remove cached certificate files from extension container
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *containerURLs = [fm URLsForDirectory:NSLibraryDirectory
+                                        inDomains:NSUserDomainMask];
+    if (containerURLs.count > 0) {
+      NSURL *containerURL = [containerURLs[0]
+          URLByAppendingPathComponent:
+              @"Containers/com.andrei.rocei.connector.extension/Data"];
+      for (NSString *f in @[
+             @"auth_cert.der", @"sign_cert.der", @"auth_keyid.bin"
+           ]) {
+        [fm removeItemAtPath:
+                [containerURL URLByAppendingPathComponent:f].path
+                       error:nil];
+      }
+    }
+    [self completeRow:cleanupRow
+              success:YES
+              summary:@"Processes killed, certs cleared"
+               detail:nil];
+
+    // 5. Move app to Trash
+    [self startRow:trashRow];
+    NSURL *appURL = [NSURL fileURLWithPath:appPath];
+    NSURL *trashedURL = nil;
+    NSError *trashError = nil;
+    BOOL trashed = [fm trashItemAtURL:appURL
+                     resultingItemURL:&trashedURL
+                                error:&trashError];
+    if (trashed) {
+      [self completeRow:trashRow
+                success:YES
+                summary:@"Moved to Trash"
+                 detail:trashedURL.path];
+    } else {
+      [self completeRow:trashRow
+                success:NO
+                summary:@"Could not move to Trash"
+                 detail:trashError.localizedDescription];
+    }
+
+    // Give the UI a moment to render final status, then quit
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+          [NSApp terminate:nil];
+        });
   });
 }
 
