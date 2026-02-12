@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>XPC!</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>NSExtension</key>
+	<dict>
+		<key>NSExtensionPointIdentifier</key>
+		<string>com.apple.ctk-tokens</string>
+		<key>NSExtensionAttributes</key>
+		<dict>
+			<key>com.apple.ctk.class-id</key>
+			<string>com.andrei.rocei.connector.extension</string>
+			<!-- Smartcard auto-detection mode: ctkd matches card by ATR on insertion.
+			     AID-based matching (com.apple.ctk.aid) is not possible — the card returns
+			     6A 82 for every SELECT P1=04 (DF name) regardless of AID or P2 value.
+			     The IDEMIA PKCS#11 library uses a proprietary access sequence, not standard
+			     ISO 7816 AID selection. ATR matching is tried first; if ctkd ignores
+			     com.apple.ctk.atr for third-party extensions the extension falls back to
+			     catch-all behaviour (no AID declared = tried for every card insertion).
+			     ROCEICard.initWithSmartCard: returns nil for non-CEI cards in that case. -->
+			<!-- DISABLED: smartcard auto-detection — persistent/explicit registration is active
+			<key>com.apple.ctk.driver-class</key>
+			<string>ROCEIDriver</string>
+			<key>com.apple.ctk.token-type</key>
+			<string>smartcard</string>
+			-->
+			<!-- Romanian eID ATR: 3B DF 96 00 81 31 FE 45 80 73 84 21 E0 55 69 78 00 00 80 83 07 90 00 24 -->
+			<!-- DISABLED: ATR matching for smartcard auto-detect
+			<key>com.apple.ctk.atr</key>
+			<array>
+				<string>3BDF96008131FE4580738421E05569780000808307900024</string>
+			</array>
+			-->
+			<!-- DISABLED: AID matching — card returns 6A 82 for all SELECT P1=04 commands
+			<key>com.apple.ctk.aid</key>
+			<array>
+				<string>E828BD080FD25047656E65726963</string>
+			</array>
+			-->
+			<key>com.apple.ctk.driver-class</key>
+			<string>ROCEIPersistentDriver</string>
+			<key>com.apple.ctk.token-type</key>
+			<string>persistent</string>
+		</dict>
+	</dict>
+</dict>
+</plist>
